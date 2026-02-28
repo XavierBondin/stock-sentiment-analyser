@@ -5,6 +5,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
+import math
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -222,6 +223,150 @@ def sentiment_label(score: float) -> tuple[str, str]:
         return "NEUTRAL ➡️", "#facc15"
 
 
+# ─────────────────────────────────────────────
+# BAYESIAN NETWORK
+#
+# We model sentiment as a Hidden Markov-style
+# Bayesian update problem with 3 hidden states:
+#   - Bullish  (score > 0.2)
+#   - Neutral  (-0.2 to 0.2)
+#   - Bearish  (score < -0.2)
+#
+# Starting from a uniform prior (equal probability
+# for each state), we update our belief after each
+# headline using Bayes' theorem:
+#
+#   P(state | evidence) ∝ P(evidence | state) × P(state)
+#
+# P(evidence | state) is the likelihood — how probable
+# is this headline's score given each state?
+# We model this as a Gaussian (normal distribution)
+# centred on the expected score for that state.
+# ─────────────────────────────────────────────
+
+import math
+
+def gaussian(x: float, mu: float, sigma: float) -> float:
+    """
+    Gaussian probability density function.
+    Tells us how likely a score x is given a
+    state with mean mu and standard deviation sigma.
+    """
+    return (1 / (sigma * math.sqrt(2 * math.pi))) * math.exp(-0.5 * ((x - mu) / sigma) ** 2)
+
+
+def bayesian_update(scored: list[dict]) -> list[dict]:
+    """
+    Runs a Bayesian belief update across all headlines in order.
+
+    For each headline, we:
+    1. Compute the likelihood of its score under each state
+    2. Multiply by the current prior (previous belief)
+    3. Normalise so probabilities sum to 1
+    4. Record the updated belief — this becomes the new prior
+
+    Returns a list of belief states over time, one per headline.
+
+    State parameters (mu = expected score, sigma = uncertainty):
+      - Bullish:  mu = +0.5, sigma = 0.25
+      - Neutral:  mu =  0.0, sigma = 0.15
+      - Bearish:  mu = -0.5, sigma = 0.25
+    """
+    states = {
+        "Bullish":  {"mu": 0.5,  "sigma": 0.25, "color": "#4ade80"},
+        "Neutral":  {"mu": 0.0,  "sigma": 0.15, "color": "#facc15"},
+        "Bearish":  {"mu": -0.5, "sigma": 0.25, "color": "#f87171"},
+    }
+
+    # Uniform prior — we start with no strong belief
+    prior = {"Bullish": 1/3, "Neutral": 1/3, "Bearish": 1/3}
+    history = []
+
+    for i, h in enumerate(scored):
+        score = h["score"]
+
+        # Step 1: Compute likelihoods P(score | state)
+        likelihoods = {
+            state: gaussian(score, params["mu"], params["sigma"])
+            for state, params in states.items()
+        }
+
+        # Step 2: Multiply likelihood × prior (unnormalised posterior)
+        unnormalised = {
+            state: likelihoods[state] * prior[state]
+            for state in states
+        }
+
+        # Step 3: Normalise so all probabilities sum to 1
+        total = sum(unnormalised.values())
+        posterior = {state: unnormalised[state] / total for state in states}
+
+        # Record this belief snapshot
+        history.append({
+            "headline_num": i + 1,
+            "headline": h["headline"][:60] + "..." if len(h["headline"]) > 60 else h["headline"],
+            "score": score,
+            "p_bullish": round(posterior["Bullish"], 4),
+            "p_neutral": round(posterior["Neutral"], 4),
+            "p_bearish": round(posterior["Bearish"], 4),
+            "dominant": max(posterior, key=posterior.get),
+        })
+
+        # The posterior becomes the prior for the next headline
+        prior = posterior
+
+    return history
+
+
+def make_bayesian_chart(history: list[dict]) -> go.Figure:
+    """
+    Line chart showing how the probability of each
+    sentiment state evolves as each headline is processed.
+    This is the core visualisation of sentiment as a function of time.
+    """
+    x = [h["headline_num"] for h in history]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=[h["p_bullish"] for h in history],
+        name="P(Bullish)", line=dict(color="#4ade80", width=2),
+        fill="tozeroy", fillcolor="rgba(74,222,128,0.05)"
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=[h["p_neutral"] for h in history],
+        name="P(Neutral)", line=dict(color="#facc15", width=2),
+        fill="tozeroy", fillcolor="rgba(250,204,21,0.05)"
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=[h["p_bearish"] for h in history],
+        name="P(Bearish)", line=dict(color="#f87171", width=2),
+        fill="tozeroy", fillcolor="rgba(248,113,113,0.05)"
+    ))
+    fig.update_layout(
+        height=280,
+        margin=dict(t=10, b=30, l=10, r=10),
+        paper_bgcolor="#0e0e1a",
+        plot_bgcolor="#0e0e1a",
+        font={"color": "#888", "size": 11},
+        xaxis=dict(
+            title="Headline #", showgrid=False,
+            tickmode="linear", tick0=1, dtick=1,
+            tickfont={"color": "#444"}
+        ),
+        yaxis=dict(
+            title="Probability", showgrid=True,
+            gridcolor="#111120", range=[0, 1],
+            tickformat=".0%", tickfont={"color": "#444"}
+        ),
+        legend=dict(
+            bgcolor="#0e0e1a", bordercolor="#1e1e35",
+            borderwidth=1, font={"color": "#888"}
+        ),
+        hovermode="x unified"
+    )
+    return fig
+
+
 def make_gauge(score: float, color: str) -> go.Figure:
     """
     Creates a Plotly gauge chart for the overall sentiment score.
@@ -394,14 +539,48 @@ if run and query:
             </div>
         """, unsafe_allow_html=True)
 
+    # ── BAYESIAN NETWORK ──
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<p style="font-size:10px;letter-spacing:3px;color:#444;text-transform:uppercase;margin-top:8px">Bayesian Sentiment Network · Probability Over Time</p>', unsafe_allow_html=True)
+    st.markdown("""
+        <div style="background:#0e0e1a;border:1px solid #1e1e35;border-radius:12px;padding:16px 20px;margin-bottom:16px;font-size:12px;color:#666;line-height:1.7">
+            Starting from a <b style="color:#888">uniform prior</b> (33% each state), the model applies
+            <b style="color:#888">Bayes' theorem</b> after each headline — updating the probability of each
+            sentiment regime using a Gaussian likelihood function. Watch how conviction builds as evidence accumulates.
+        </div>
+    """, unsafe_allow_html=True)
+
+    bayes_history = bayesian_update(scored)
+    final_belief = bayes_history[-1]
+    dominant = final_belief["dominant"]
+    dom_color = "#4ade80" if dominant == "Bullish" else "#f87171" if dominant == "Bearish" else "#facc15"
+
+    # Final belief metrics
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Final Dominant State", dominant)
+    b2.metric("P(Bullish)", f"{final_belief['p_bullish']:.1%}")
+    b3.metric("P(Neutral)", f"{final_belief['p_neutral']:.1%}")
+    b4.metric("P(Bearish)", f"{final_belief['p_bearish']:.1%}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Bayesian chart
+    st.plotly_chart(make_bayesian_chart(bayes_history), use_container_width=True)
+
+    # Belief evolution table
+    with st.expander("🧠 View full belief update history"):
+        bayes_df = pd.DataFrame(bayes_history)
+        bayes_df.columns = ["#", "Headline", "VADER Score", "P(Bullish)", "P(Neutral)", "P(Bearish)", "Dominant State"]
+        st.dataframe(bayes_df, use_container_width=True)
+
     # ── RAW DATA TABLE ──
-    with st.expander("📊 View raw data as table"):
+    with st.expander("📊 View raw VADER data as table"):
         df = pd.DataFrame(scored)
         st.dataframe(df, use_container_width=True)
 
     st.markdown("""
         <p style="color:#2a2a3a;font-size:11px;text-align:center;margin-top:24px;letter-spacing:1px">
-        Sentiment scored via VADER NLP · For educational & research purposes only · Not financial advice
+        Sentiment scored via VADER NLP · Bayesian updates via Gaussian likelihood · For educational & research purposes only · Not financial advice
         </p>
     """, unsafe_allow_html=True)
 
